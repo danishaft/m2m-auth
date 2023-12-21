@@ -6,10 +6,9 @@ const dotenv = require('dotenv');
 const { MongoClient, ServerApiVersion } = require('mongodb');
 const stytch = require('stytch');
 const axios = require('axios');
-
+const mongodbHelpers = require('./Helpers/mongodb')
 
 dotenv.config();
-
 const app = express();
 const PORT = process.env.PORT;
 
@@ -18,8 +17,7 @@ const PORT = process.env.PORT;
 const client = new stytch.Client({
     project_id: process.env.STYTCH_PROJECT_ID,
     secret: process.env.STYTCH_SECRET,
-  });
-
+});
 
 async function connectToMongoDB() {
     const mongoURI = process.env.MONGODB_URI;
@@ -51,8 +49,17 @@ app.use(morgan('combined'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 let db;
+
+// payment details
+const paymentDetails = {
+    customerId: '123456',
+    amount: 50,
+    destination: 'Wallet123',
+  };
+
 //routes
-app.get('/profiles', async (req, res) => {
+// Endpoint to initiate the payment process
+app.get('/initiate-payment', async (req, res) => {
    //create an m2m client
    try{
     // Connect to MongoDB and set up routes and server
@@ -60,14 +67,12 @@ app.get('/profiles', async (req, res) => {
     const m2mClient = await createM2MClient();
     // Get M2M access token (cached if possible)
     const accessToken = await getM2MAccessToken(m2mClient.client_id, m2mClient.client_secret)
-    // Get profiles from the resource server using the obtained access token
-    const profiles = await getProfilesFromResourceServer(accessToken);
+    // initiate payment
+    const accountResponse = await initiatePayment(accessToken);
 
-    res.json({
-        profiles: profiles
-    });
+    res.json(accountResponse);
    }catch (err){
-        console.error('Error getting profiles:', err.response ? err.response.data : err.message);
+        console.error(err.response ? err.response.data : err.message);
             res.status(err.response ? err.response.status : 500).json({
                 error: err.response ? err.response.data : 'Internal Server Error',
         });
@@ -85,7 +90,7 @@ app.get('/search-m2m-client', async (req, res) => {
             operands: [
                 {
                     filter_name: 'client_name',
-                    filter_value: ['profiles-client'],
+                    filter_value: ['payment-service'],
                 }
             ],
         },
@@ -136,12 +141,12 @@ app.put('/update-m2m-client/:clientId', async (req, res) => {
   async function createM2MClient() {
     try {
         // Check if M2M credentials are available in MongoDB
-        const storedCredentials = await getCredentials();
+        const storedCredentials = await mongodbHelpers.getCredentials(db);
         if (!storedCredentials.client_id || !storedCredentials.client_secret) {
             // If not available, create a new m2m client and store the credentials
             console.log('m2m client credentials is not available')
             const params = {
-                client_name: 'profiles-client',
+                client_name: 'payment-service',
                 scopes: ['read:users', 'write:users'],
             };
             const response = await client.m2m.clients.create(params)
@@ -153,7 +158,7 @@ app.put('/update-m2m-client/:clientId', async (req, res) => {
                 expiresAt: expiresAt
             }
             // Store the new credentials securely in MongoDB
-            await storeCredentials(m2mClient);
+            await mongodbHelpers.storeCredentials(db, m2mClient);
             return m2mClient
         }else if(Date.now() > storedCredentials.expiresAt){
             //30 mins elapsed, start secret rotation
@@ -176,12 +181,11 @@ app.put('/update-m2m-client/:clientId', async (req, res) => {
 async function getM2MAccessToken(clientId, clientSecret){
     try {
         // Get M2M access token (cached if possible)
-        const accessTokenInfo = await getAccessToken();
+        const accessTokenInfo = await mongodbHelpers.getAccessToken(db);
         if (accessTokenInfo && Date.now() < accessTokenInfo.expires_at) {
             // Use the cached token if it's valid
             return accessTokenInfo.access_token;
         } 
-
         // If the cached token is expired or not available, request a new one
         const params = {
             client_id: clientId,
@@ -189,12 +193,10 @@ async function getM2MAccessToken(clientId, clientSecret){
             scopes: ['read:users', 'write:users'], // Adjust scopes as needed
             grant_type: 'client_credentials'
         };
-
         const response = await client.m2m.token(params);
-
         //store new access token to db
         const expiresAt = Date.now() + response.expires_in * 1000; // Set expiration time to 1 hour (adjust as needed)
-        await storeAccessToken(response.access_token, expiresAt);
+        await mongodbHelpers.storeAccessToken(db, response.access_token, expiresAt);
         
         return response.access_token;
     }catch(err){
@@ -220,89 +222,52 @@ async function getM2MAccessToken(clientId, clientSecret){
             expiresAt: expiresAt
         }
         // Store the new credentials securely in MongoDB
-        await storeCredentials(m2mClient);
+        await mongodbHelpers.storeCredentials(db, m2mClient);
         return m2mClient;
     }catch(err){
         console.error('Error starting secret rotation:', err.response);
         throw err;
     }
   }
-
   
-    //complete the rotation
-    async function completeSecretRotation(client_id){
-        try{
-            //permanently switch the client_secret for the next_client_secret
-            const params = {
-                client_id: client_id,
-            };
-          
-            await client.m2m.clients.secrets.rotate(params);
-        }catch(err){
-            console.error('Error completing secret rotation:', err.response);
-            throw err;
-        }
-    };
+//complete the rotation
+async function completeSecretRotation(client_id){
+    try{
+        //permanently switch the client_secret for the next_client_secret
+        const params = {
+            client_id: client_id,
+        };
+        
+        await client.m2m.clients.secrets.rotate(params);
+    }catch(err){
+        console.error('Error completing secret rotation:', err.response);
+        throw err;
+    }
+};
 
-
-//get resource from resource server
-async function getProfilesFromResourceServer(accessToken) {
-    const resourceServerUrl = 'http://localhost:4000/api/profiles-data'; // Replace with your resource server URL
+//initiate payment
+async function initiatePayment(accessToken) {
+    const accountServerUrl = 'http://localhost:4000/api/check-balance'; // Replace with your resource server URL
     try {
-        console.log('going to resource', accessToken)
-        const response = await axios.get(resourceServerUrl, {
+        //request customer balance from account server
+        const response = await axios.post(accountServerUrl, paymentDetails, {
             headers: {
             'Authorization': `Bearer ${accessToken}`,
             'Content-Type': 'application/json',
             },
         });
-  
-      return response.data;
+        const {accountName, balance} = response.data
+        // Check if the balance is sufficient for the transaction
+        if (balance >= paymentDetails.amount) {
+            // Proceed with the transaction logic
+            console.log('Transaction successful!');
+            return `${accountName} your payment of ${paymentDetails.amount} to ${paymentDetails.destination} was successful!`;
+        }
+        console.log('Insufficient balance. Transaction failed.');
+        return 'Insufficient balance. Transaction failed.';
     } catch (error) {
-      console.error('Error getting profiles from resource server:', error.response ? error.response.data : error.message);
+      console.error('Error connecting with the Account Server:', error.response ? error.response.data : error.message);
       throw error;
-    }
-  }
-
-  // Helper function to retrieve credentials from MongoDB
-async function getCredentials() {
-    try{
-        const credentials = await db.collection('credentials').findOne({});
-        return credentials || {};
-    }catch(err){
-        console.error('Error getting credentials from MongoDB:', err);
-        throw err;
-    }
-}
-// Helper function to store credentials in MongoDB
-async function storeCredentials(credentials) {
-   try{
-    await db.collection('credentials').updateOne({}, { $set: credentials }, { upsert: true });
-   }catch(err){
-    console.error('Error storing credentials in MongoDB:', err);
-    throw err;
-   }
-}
-
-
-// Helper Function to get cached access token from MongoDB
-async function getAccessToken() {
-    try {
-        // Retrieve the cached access token information from MongoDB
-        return await db.collection('accessToken').findOne({});
-    } catch (err) {
-        console.error('Error getting access token:', err);
-        throw err;
-    }
-}
-
-// helper function to Store the access token and its expiration time in MongoDB
-async function storeAccessToken(accessToken, expiresAt) {
-    try {
-        await db.collection('accessToken').updateOne({}, { $set: { access_token: accessToken, expires_at: expiresAt } }, { upsert: true });
-    } catch (err) {
-        console.error('Error storing access token:', err);
-        throw err;
     }
 }
 
