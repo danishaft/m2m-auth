@@ -1,8 +1,6 @@
 const express = require('express');
-const router = express.Router();
 const dotenv = require('dotenv');
 const stytch = require('stytch');
-const axios = require('axios');
 
 dotenv.config();
 
@@ -13,7 +11,7 @@ const client = new stytch.Client({
 });
 
 
-// Middleware for server-to-server API call
+// Middleware for authenticating access token
 const authenticateTokenMiddleware = (requiredScope) => {
   return async (req, res, next) => {
     try {
@@ -28,9 +26,6 @@ const authenticateTokenMiddleware = (requiredScope) => {
         };
         const response = await client.m2m.authenticateToken(params)
         console.log(response)
-     
-        //Attach the response to the request user object
-        req.user = response;
       next();
     } catch (error) {
       console.error('Error in middleware:', error);
